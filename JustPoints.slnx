@@ -1,0 +1,9 @@
+<Solution>
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="JustPoints.csproj" Id="55eba57c-43f1-4caf-8c55-22a24e70ea50">
+    <Platform Solution="*|x64" Project="x64" />
+  </Project>
+</Solution>
