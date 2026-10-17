@@ -5,6 +5,8 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using TaleWorlds.CampaignSystem;
+using TaleWorlds.CampaignSystem.CharacterDevelopment;
+using TaleWorlds.CampaignSystem.Extensions;
 using TaleWorlds.CampaignSystem.MapEvents;
 using TaleWorlds.CampaignSystem.Party;
 using TaleWorlds.Core;
@@ -65,6 +67,7 @@ namespace JustPoints
 
                 try { LoadData(); } catch (Exception ex) { LogError("LoadData", ex); }
                 try { CleanupStaleHeroes(); } catch (Exception ex) { LogError("CleanupStaleHeroes", ex); }
+                try { CleanupUnspendablePoints(); } catch (Exception ex) { LogError("CleanupUnspendablePoints (OnGameStart)", ex); }
 
                 CampaignEvents.MapEventStarted.AddNonSerializedListener(this, OnMapEventStarted);
                 CampaignEvents.MapEventEnded.AddNonSerializedListener(this, OnMapEventEnded);
@@ -165,6 +168,7 @@ namespace JustPoints
                 }
 
                 _killsInCurrentBattle.Clear();
+                CleanupUnspendablePoints();
                 SaveData();
             }
             catch (Exception ex) { LogError("OnMapEventEnded", ex); }
@@ -216,6 +220,133 @@ namespace JustPoints
         }
 
         // =====================================================================
+        // ПРОВЕРКА: ЕСТЬ ЛИ КУДА ТРАТИТЬ ОЧКИ
+        // =====================================================================
+        // Метод отвечает на простой вопрос: есть ли у героя ХОТЬ ОДИН
+        // свободный слот, чтобы вложить очередное очко?
+        //
+        //   true  — есть куда вкладывать. Очки (даже «висящие») — легитимные,
+        //           их не трогаем, мод продолжает начислять.
+        //   false — все слоты забиты. Любые очки в Unspent* — «лишние»,
+        //           их можно безопасно обнулить.
+        //
+        // ВАЖНО: в этой проверке НЕ сравниваем Unspent с remainingCapacity.
+        // Иначе при равном количестве («2 очка, 2 слота») метод ошибочно
+        // решал бы, что место кончилось, и сносил бы нормальные очки.
+        // =====================================================================
+
+        private static bool CanHeroSpendMoreFocus(Hero hero)
+        {
+            try
+            {
+                if (hero?.HeroDeveloper == null) return false;
+
+                int maxFocusPerSkill = 5;
+                try
+                {
+                    var devModel = Campaign.Current?.Models?.CharacterDevelopmentModel;
+                    if (devModel != null)
+                        maxFocusPerSkill = devModel.MaxFocusPerSkill;
+                }
+                catch { }
+
+                int remainingCapacity = 0;
+                foreach (var skill in Skills.All)
+                {
+                    if (skill == null) continue;
+                    int current = hero.HeroDeveloper.GetFocus(skill);
+                    int free = maxFocusPerSkill - current;
+                    if (free > 0) remainingCapacity += free;
+                }
+
+                return remainingCapacity > 0;
+            }
+            catch { return true; }
+        }
+
+        private static bool CanHeroSpendMoreAttributes(Hero hero)
+        {
+            try
+            {
+                if (hero?.HeroDeveloper == null) return false;
+
+                int maxAttr = 10;
+                try
+                {
+                    var devModel = Campaign.Current?.Models?.CharacterDevelopmentModel;
+                    if (devModel != null)
+                        maxAttr = devModel.MaxAttribute;
+                }
+                catch { }
+
+                // DefaultCharacterAttributes.All в API нет — перебираем шесть базовых
+                // атрибутов вручную (Vigor, Control, Endurance, Cunning, Social, Intelligence).
+                var attributes = new[]
+                {
+                    DefaultCharacterAttributes.Vigor,
+                    DefaultCharacterAttributes.Control,
+                    DefaultCharacterAttributes.Endurance,
+                    DefaultCharacterAttributes.Cunning,
+                    DefaultCharacterAttributes.Social,
+                    DefaultCharacterAttributes.Intelligence,
+                };
+
+                int remainingCapacity = 0;
+                foreach (var attr in attributes)
+                {
+                    if (attr == null) continue;
+                    int current = hero.GetAttributeValue(attr);
+                    int free = maxAttr - current;
+                    if (free > 0) remainingCapacity += free;
+                }
+
+                return remainingCapacity > 0;
+            }
+            catch { return true; }
+        }
+
+        // Принудительно обнуляет уже выданные, но невложимые очки.
+        // Вызывается при загрузке сейва и после каждого боя.
+        //
+        // Работает ТОЛЬКО когда CanHeroSpendMore* вернул false, то есть
+        // свободных слотов ноль. Если хоть один слот есть — очки не трогаем:
+        // это нормальные «нераспределённые», игрок сам их разложит.
+        private void CleanupUnspendablePoints()
+        {
+            try
+            {
+                var settings = JustPointsSettings.Instance;
+                if (settings == null || !settings.EnableMod) return;
+                if (Campaign.Current == null) return;
+
+                Hero mainHero;
+                try { mainHero = Hero.MainHero; }
+                catch { return; }
+                if (mainHero?.Clan == null) return;
+
+                foreach (var hero in mainHero.Clan.Heroes)
+                {
+                    if (hero == null) continue;
+                    if (hero.HeroState == Hero.CharacterStates.Dead) continue;
+                    if (hero.HeroDeveloper == null) continue;
+
+                    // Фокус: свободных скилл-слотов ноль — обнуляем висящие очки.
+                    if (!CanHeroSpendMoreFocus(hero) && hero.HeroDeveloper.UnspentFocusPoints > 0)
+                    {
+                        hero.HeroDeveloper.UnspentFocusPoints = 0;
+                    }
+
+                    // Атрибуты: все шесть на максимуме — обнуляем висящие очки.
+                    if (!CanHeroSpendMoreAttributes(hero) && hero.HeroDeveloper.UnspentAttributePoints > 0)
+                    {
+                        hero.HeroDeveloper.UnspentAttributePoints = 0;
+                    }
+                }
+            }
+            catch (Exception ex) { LogError("CleanupUnspendablePoints", ex); }
+        }
+
+        // =====================================================================
         // НАЧИСЛЕНИЕ ОЧКОВ
         // =====================================================================
 
@@ -236,27 +367,37 @@ namespace JustPoints
 
                 if (focusEnabled && focusThreshold > 0)
                 {
-                    settings.AddKillsForFocus(hero, kills);
-                    int totalFocusKills = settings.GetKillsForFocus(hero);
-                    int desiredAward = totalFocusKills / focusThreshold;
-
-                    if (desiredAward > 0)
+                    if (!CanHeroSpendMoreFocus(hero))
                     {
-                        hero.HeroDeveloper.UnspentFocusPoints += desiredAward;
-                        int usedKills = desiredAward * focusThreshold;
-                        int remaining = totalFocusKills - usedKills;
-                        settings.SetKillsForFocus(hero, remaining);
+                        // Свободных слотов нет — обнуляем накопитель «убийств до очка»,
+                        // чтобы он не рос впустую. Само начисление не производим.
+                        if (settings.GetKillsForFocus(hero) != 0)
+                            settings.SetKillsForFocus(hero, 0);
+                    }
+                    else
+                    {
+                        settings.AddKillsForFocus(hero, kills);
+                        int totalFocusKills = settings.GetKillsForFocus(hero);
+                        int desiredAward = totalFocusKills / focusThreshold;
 
-                        try
+                        if (desiredAward > 0)
                         {
-                            TextObject msg = new TextObject("{=JP_FocusGained}Just Points: {HERO} gained {POINTS} focus point(s). Remaining kills: {REMAIN}.");
-                            msg.SetTextVariable("HERO", hero.Name);
-                            msg.SetTextVariable("POINTS", desiredAward);
-                            msg.SetTextVariable("REMAIN", remaining);
-                            if (Campaign.Current != null)
-                                InformationManager.DisplayMessage(new InformationMessage(msg.ToString()));
+                            hero.HeroDeveloper.UnspentFocusPoints += desiredAward;
+                            int usedKills = desiredAward * focusThreshold;
+                            int remaining = totalFocusKills - usedKills;
+                            settings.SetKillsForFocus(hero, remaining);
+
+                            try
+                            {
+                                TextObject msg = new TextObject("{=JP_FocusGained}Just Points: {HERO} gained {POINTS} focus point(s). Remaining kills: {REMAIN}.");
+                                msg.SetTextVariable("HERO", hero.Name);
+                                msg.SetTextVariable("POINTS", desiredAward);
+                                msg.SetTextVariable("REMAIN", remaining);
+                                if (Campaign.Current != null)
+                                    InformationManager.DisplayMessage(new InformationMessage(msg.ToString()));
+                            }
+                            catch { }
                         }
-                        catch { }
                     }
                 }
 
@@ -269,27 +410,35 @@ namespace JustPoints
 
                 if (attEnabled && attThreshold > 0)
                 {
-                    settings.AddKillsForAttribute(hero, kills);
-                    int totalAttKills = settings.GetKillsForAttribute(hero);
-                    int desiredAward = totalAttKills / attThreshold;
-
-                    if (desiredAward > 0)
+                    if (!CanHeroSpendMoreAttributes(hero))
                     {
-                        hero.HeroDeveloper.UnspentAttributePoints += desiredAward;
-                        int usedKills = desiredAward * attThreshold;
-                        int remaining = totalAttKills - usedKills;
-                        settings.SetKillsForAttribute(hero, remaining);
+                        if (settings.GetKillsForAttribute(hero) != 0)
+                            settings.SetKillsForAttribute(hero, 0);
+                    }
+                    else
+                    {
+                        settings.AddKillsForAttribute(hero, kills);
+                        int totalAttKills = settings.GetKillsForAttribute(hero);
+                        int desiredAward = totalAttKills / attThreshold;
 
-                        try
+                        if (desiredAward > 0)
                         {
-                            TextObject msg = new TextObject("{=JP_AttributeGained}Just Points: {HERO} gained {POINTS} attribute point(s). Remaining kills: {REMAIN}.");
-                            msg.SetTextVariable("HERO", hero.Name);
-                            msg.SetTextVariable("POINTS", desiredAward);
-                            msg.SetTextVariable("REMAIN", remaining);
-                            if (Campaign.Current != null)
-                                InformationManager.DisplayMessage(new InformationMessage(msg.ToString()));
+                            hero.HeroDeveloper.UnspentAttributePoints += desiredAward;
+                            int usedKills = desiredAward * attThreshold;
+                            int remaining = totalAttKills - usedKills;
+                            settings.SetKillsForAttribute(hero, remaining);
+
+                            try
+                            {
+                                TextObject msg = new TextObject("{=JP_AttributeGained}Just Points: {HERO} gained {POINTS} attribute point(s). Remaining kills: {REMAIN}.");
+                                msg.SetTextVariable("HERO", hero.Name);
+                                msg.SetTextVariable("POINTS", desiredAward);
+                                msg.SetTextVariable("REMAIN", remaining);
+                                if (Campaign.Current != null)
+                                    InformationManager.DisplayMessage(new InformationMessage(msg.ToString()));
+                            }
+                            catch { }
                         }
-                        catch { }
                     }
                 }
             }
@@ -307,6 +456,7 @@ namespace JustPoints
                 _isGameFullyLoaded = true;
                 LoadData();
                 CleanupStaleHeroes();
+                CleanupUnspendablePoints();
             }
             catch (Exception ex) { LogError("OnGameLoaded", ex); }
         }
